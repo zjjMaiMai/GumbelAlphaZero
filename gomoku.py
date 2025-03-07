@@ -87,198 +87,85 @@ class Env(core.Env):
     def num_players(self) -> int:
         return 2
 
+    def to_svg(self, state, filename, grid_size=25, scale=1.0):
+        import svgwrite
 
-def to_svg(states: State, filename: str):
-    import svgwrite
-    from dataclasses import dataclass
+        grid_size = 25
+        board_size = int(math.sqrt(state.board.shape[-1]))
+        dwg = svgwrite.Drawing(
+            filename, ((board_size + 1) * grid_size, (board_size + 1) * grid_size)
+        )
 
-    @dataclass
-    class ColorSet:
-        p1_color: str = "black"
-        p2_color: str = "white"
-        p1_outline: str = "black"
-        p2_outline: str = "black"
-        background_color: str = "white"
-        grid_color: str = "black"
-        text_color: str = "black"
-
-    config = {
-        "GRID_SIZE": -1,
-        "BOARD_WIDTH": -1,
-        "BOARD_HEIGHT": -1,
-        "COLOR_THEME": "light",
-        "COLOR_SET": ColorSet(),
-        "SCALE": 1.0,
-    }
-
-    def _get_nth_state(states: State, i):
-        return jax.tree_util.tree_map(lambda x: x[i], states)
-
-    def _make_gomoku_dwg(dwg, state, config):
-        GRID_SIZE = config["GRID_SIZE"]
-        BOARD_SIZE = config["BOARD_WIDTH"]
-        color_set = config["COLOR_SET"]
-
-        # background
         dwg.add(
             dwg.rect(
                 (0, 0),
-                (BOARD_SIZE * GRID_SIZE, BOARD_SIZE * GRID_SIZE),
-                # stroke=svgwrite.rgb(10, 10, 16, "%"),
-                fill=color_set.background_color,
+                ((board_size + 1) * grid_size, (board_size + 1) * grid_size),
+                fill="white",
             )
         )
 
-        # board
-        # grid
-        board_g = dwg.g()
-        hlines = board_g.add(dwg.g(id="hlines", stroke=color_set.grid_color))
-        for y in range(1, BOARD_SIZE - 1):
-            hlines.add(
+        for i in range(board_size):
+            dwg.add(
                 dwg.line(
-                    start=(0, GRID_SIZE * y),
-                    end=(
-                        GRID_SIZE * (BOARD_SIZE - 1),
-                        GRID_SIZE * y,
-                    ),
+                    (grid_size, grid_size * (i + 1)),
+                    (board_size * grid_size, grid_size * (i + 1)),
+                    stroke="black",
                     stroke_width="0.5px",
                 )
             )
-        vlines = board_g.add(dwg.g(id="vline", stroke=color_set.grid_color))
-        for x in range(1, BOARD_SIZE - 1):
-            vlines.add(
+            dwg.add(
+                dwg.text(
+                    text=f"{i}",
+                    insert=(grid_size // 2, grid_size * (i + 1)),
+                    font_size="16px",
+                    font_family="Menlo",
+                    text_anchor="middle",
+                    dominant_baseline="middle",
+                )
+            )
+            dwg.add(
                 dwg.line(
-                    start=(GRID_SIZE * x, 0),
-                    end=(
-                        GRID_SIZE * x,
-                        GRID_SIZE * (BOARD_SIZE - 1),
-                    ),
+                    (grid_size * (i + 1), grid_size),
+                    (grid_size * (i + 1), board_size * grid_size),
+                    stroke="black",
                     stroke_width="0.5px",
                 )
             )
-        board_g.add(
+            dwg.add(
+                dwg.text(
+                    text=f"{i}",
+                    insert=(grid_size * (i + 1), grid_size // 2),
+                    font_size="16px",
+                    font_family="Menlo",
+                    text_anchor="middle",
+                    dominant_baseline="middle",
+                )
+            )
+
+        dwg.add(
             dwg.rect(
-                (0, 0),
+                (grid_size, grid_size),
                 (
-                    (BOARD_SIZE - 1) * GRID_SIZE,
-                    (BOARD_SIZE - 1) * GRID_SIZE,
+                    board_size * grid_size - grid_size,
+                    board_size * grid_size - grid_size,
                 ),
                 fill="none",
-                stroke=color_set.grid_color,
+                stroke="black",
                 stroke_width="2px",
             )
         )
 
-        # stones
-        board = jnp.clip(state.board, -1, 1)
-        for xy, stone in enumerate(board):
-            if stone == -1:
-                continue
-            stone_y = xy // BOARD_SIZE * GRID_SIZE
-            stone_x = xy % BOARD_SIZE * GRID_SIZE
-
-            color = color_set.p1_color if stone == 0 else color_set.p2_color
-            outline = color_set.p1_outline if stone == 0 else color_set.p2_outline
-            board_g.add(
-                dwg.circle(
-                    center=(stone_x, stone_y),
-                    r=GRID_SIZE / 2.2,
-                    stroke=outline,
-                    fill=color,
+        for idx, stone in enumerate(jnp.clip(state.board, -1, 1)):
+            if stone != -1:
+                y, x = divmod(idx, board_size)
+                dwg.add(
+                    dwg.circle(
+                        center=((x + 1) * grid_size, (y + 1) * grid_size),
+                        r=grid_size / 2.2,
+                        stroke="black",
+                        fill="black" if stone == 0 else "white",
+                    )
                 )
-            )
-            # if xy == state.last_action:
-            #     board_g.add(
-            #         dwg.circle(
-            #             center=(stone_x, stone_y),
-            #             r=GRID_SIZE / 2.2 / 3,
-            #             fill="red",
-            #         )
-            #     )
 
-        board_g.translate(GRID_SIZE / 2, GRID_SIZE / 2)
-        return board_g
-
-    try:
-        SIZE = len(states.current_player)
-        WIDTH = math.ceil(math.sqrt(SIZE - 0.1))
-        if SIZE - (WIDTH - 1) ** 2 >= WIDTH:
-            HEIGHT = WIDTH
-        else:
-            HEIGHT = WIDTH - 1
-        if SIZE == 1:
-            states = _get_nth_state(states, 0)
-    except TypeError:
-        SIZE = 1
-        WIDTH = 1
-        HEIGHT = 1
-
-    config["GRID_SIZE"] = 25
-    config["BOARD_WIDTH"] = int(math.sqrt(states.board.shape[-1]))  # type: ignore
-    config["BOARD_HEIGHT"] = int(math.sqrt(states.board.shape[-1]))  # type: ignore
-
-    GRID_SIZE = config["GRID_SIZE"]
-    BOARD_WIDTH = config["BOARD_WIDTH"]
-    BOARD_HEIGHT = config["BOARD_HEIGHT"]
-    SCALE = config["SCALE"]
-
-    dwg = svgwrite.Drawing(
-        filename,
-        (
-            (BOARD_WIDTH + 1) * GRID_SIZE * WIDTH * SCALE,
-            (BOARD_HEIGHT + 1) * GRID_SIZE * HEIGHT * SCALE,
-        ),
-    )
-    group = dwg.g()
-
-    # background
-    group.add(
-        dwg.rect(
-            (0, 0),
-            (
-                (BOARD_WIDTH + 1) * GRID_SIZE * WIDTH,
-                (BOARD_HEIGHT + 1) * GRID_SIZE * HEIGHT,
-            ),
-            fill=config["COLOR_SET"].background_color,
-        )
-    )
-
-    if SIZE == 1:
-        g = _make_gomoku_dwg(dwg, states, config)
-        g.translate(
-            GRID_SIZE * 1 / 2,
-            GRID_SIZE * 1 / 2,
-        )
-        group.add(g)
-        group.scale(SCALE)
-        dwg.add(group)
-        return dwg.save()
-
-    for i in range(SIZE):
-        x = i % WIDTH
-        y = i // WIDTH
-        _state = _get_nth_state(states, i)
-        g = _make_gomoku_dwg(dwg, _state, config)
-
-        g.translate(
-            GRID_SIZE * 1 / 2 + (BOARD_WIDTH + 1) * GRID_SIZE * x,
-            GRID_SIZE * 1 / 2 + (BOARD_HEIGHT + 1) * GRID_SIZE * y,
-        )
-        group.add(g)
-        group.add(
-            dwg.rect(
-                (
-                    (BOARD_WIDTH + 1) * GRID_SIZE * x,
-                    (BOARD_HEIGHT + 1) * GRID_SIZE * y,
-                ),
-                (
-                    (BOARD_WIDTH + 1) * GRID_SIZE,
-                    (BOARD_HEIGHT + 1) * GRID_SIZE,
-                ),
-                fill="none",
-                stroke="gray",
-            )
-        )
-    group.scale(SCALE)
-    dwg.add(group)
-    return dwg.save()
+        dwg.save()
+        return dwg

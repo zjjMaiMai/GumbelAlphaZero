@@ -174,4 +174,4 @@ cython_debug/
 .pypirc
 
 .vscode
-checkpoint
+checkpoint*

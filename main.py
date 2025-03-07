@@ -3,74 +3,147 @@ import jax
 import jax.numpy as jnp
 import optax
 import chex
-import tqdm
 from typing import NamedTuple
 from flax.training.checkpoints import save_checkpoint, restore_checkpoint
 import pgx
+from pgx.experimental import auto_reset
 
-from model import AZNet, TrainState, create_train_state, model_evaluate
-import mcts
+from model import AZNet, TrainState, create_train_state, model_evaluate, transforms
+import mctx
 import gomoku
 
-env = gomoku.Env(3, 3)
+env = gomoku.Env(9, 5)
 
 seed = 42
-weight_decay = 1e-5
-num_batchsize_train = 4096
+num_batchsize_train = 1024
 num_batchsize_test = 1024
-num_batchsize_self_play = 1024
-num_self_play = 2**17 // num_batchsize_self_play
-num_max_step_self_play = 9
-num_mcts_simulations = 32
+num_batchsize_selfplay = 1024
+num_step_selfplay = 256
+num_simulations = 32
 
 
-class TrainData(NamedTuple):
-    obs: chex.ArrayDevice
-    probs: chex.ArrayDevice
-    value: chex.ArrayDevice
-    mask: chex.ArrayDevice
+def recurrent_fn(
+    model: TrainState,
+    key: chex.PRNGKey,
+    action: chex.ArrayBatched,
+    state: pgx.State,
+):
+    player = state.current_player
+    state = jax.vmap(env.step)(state, action)
+
+    logits, value = model_evaluate(model, state.observation, key)
+    logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+    logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+
+    reward = jax.vmap(lambda x, i: x[i])(state.rewards, player)
+    recurrent_fn_output = mctx.RecurrentFnOutput(
+        reward=reward,
+        discount=jnp.where(state.terminated, 0.0, -1.0),
+        prior_logits=logits,
+        value=jnp.where(state.terminated, 0.0, value),
+    )
+    return recurrent_fn_output, state
+
+
+class Trajectory(NamedTuple):
+    obs: chex.Array
+    prob: chex.Array
+    reward: chex.Array
+    discount: chex.Array
+    terminated: chex.Array
+
+
+class Sample(NamedTuple):
+    obs: chex.Array
+    prob: chex.Array
+    value: chex.Array
+    mask: chex.Array
 
 
 @jax.jit
-def self_play(model: TrainState, key: chex.PRNGKey) -> TrainData:
-    key, subkey = jax.random.split(key)
-    state = jax.vmap(env.init)(jax.random.split(subkey, num_batchsize_self_play))
-
-    def body(s: pgx.State, k: chex.PRNGKey):
-        policy = mcts.mcts_search(
-            (env, model),
-            s,
-            model_evaluate,
-            k,
-            num_simulations=num_mcts_simulations,
-            max_depth=num_max_step_self_play,
+def self_play(model: TrainState, key: chex.PRNGKey) -> Sample:
+    # we need to define a function that takes a state and a key and returns a new state and a trajectory
+    def body(state: pgx.State, key: chex.PRNGKey) -> Trajectory:
+        k0, k1, k2 = jax.random.split(key, 3)
+        obs = state.observation
+        logits, value = model_evaluate(model, obs, k0)
+        root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
+        policy = mctx.gumbel_muzero_policy(
+            model,
+            k1,
+            root,
+            recurrent_fn,
+            num_simulations=num_simulations,
+            invalid_actions=~state.legal_action_mask,
         )
-        ns = jax.vmap(env.step)(s, policy.action)
-        return ns, (
-            jax.vmap(env.observe)(s),
-            policy.action_weights,
-            s.terminated,
-            s.current_player,
-            ns.rewards,
+        player = state.current_player
+        state = jax.vmap(auto_reset(env.step, env.init))(
+            state, policy.action, jax.random.split(k2, num_batchsize_selfplay)
+        )
+        return state, Trajectory(
+            obs=obs,
+            prob=policy.action_weights,
+            reward=jax.vmap(lambda x, i: x[i])(state.rewards, player),
+            discount=jnp.where(state.terminated, 0.0, -1.0),
+            terminated=state.terminated,
         )
 
-    key, subkey = jax.random.split(key)
-    _, (obs, probs, terminated, players, rewards) = jax.lax.scan(
-        body, state, jax.random.split(subkey, num_max_step_self_play)
-    )
-    value = jax.vmap(lambda x, i: x[i], in_axes=(0, 1), out_axes=1)(
-        jnp.sum(rewards, axis=0), players
+    k0, k1, k2 = jax.random.split(key, 3)
+    state = jax.vmap(env.init)(jax.random.split(k0, num_batchsize_selfplay))
+    _, traj = jax.lax.scan(
+        body,
+        state,
+        jax.random.split(k1, num_step_selfplay),
     )
 
-    mask = ~terminated.reshape(-1)
-    obs = obs.reshape(-1, *obs.shape[2:])
-    probs = probs.reshape(-1, *probs.shape[2:])
-    value = value.reshape(-1, *value.shape[2:])
-    return TrainData(obs, probs, value, mask)
+    # we calculate the value target
+    def body(value: chex.ArrayBatched, traj: Trajectory):
+        value = traj.reward + traj.discount * value
+        return value, value
+
+    _, value = jax.lax.scan(
+        body,
+        jnp.zeros_like(traj.reward[0]),
+        traj,
+        reverse=True,
+    )
+    mask = jnp.flip(jnp.cumsum(jnp.flip(traj.terminated, 0), 0), 0) >= 1
+    sample = Sample(
+        obs=traj.obs,
+        prob=traj.prob,
+        value=value,
+        mask=mask,
+    )
+    # convert (T, B, ...) to (T * B, ...)
+    sample = jax.tree.map(lambda x: x.reshape(-1, *x.shape[2:]), sample)
+
+    # data augmentation
+    def body(p, x):
+        p = jax.tree_util.keystr(p, simple=True, separator="/")
+        if p == "obs":
+            return jnp.concat([jax.vmap(t)(x) for t in transforms])
+        elif p == "prob":
+            shape = x.shape
+            x = x.reshape(-1, env.size, env.size, 1)
+            x = jnp.concat([jax.vmap(t)(x) for t in transforms])
+            x = x.reshape(-1, *shape[1:])
+            return x
+        else:
+            return jnp.concat([x for _ in transforms])
+
+    sample = jax.tree.map_with_path(body, sample)
+
+    # shuffle sample and convert to minibatch
+    ixs = jax.random.permutation(k2, sample.obs.shape[0])
+    sample = jax.tree.map(lambda x: x[ixs], sample)
+    sample = jax.tree.map(
+        lambda x: x.reshape(-1, num_batchsize_train, *x.shape[1:]), sample
+    )
+    return sample
 
 
 @jax.jit
-def train_step(model: TrainState, batch):
+def train_step(model: TrainState, batch: Sample):
 
     def loss_fn(params):
         (logits, value), new_model = model.apply_fn(
@@ -79,37 +152,31 @@ def train_step(model: TrainState, batch):
             train=True,
             mutable=["batch_stats"],
         )
-        mask = batch.mask / jnp.sum(batch.mask)
-
-        policy_loss = optax.losses.safe_softmax_cross_entropy(logits, batch.probs)
-        policy_loss = (policy_loss * mask).sum()
-
-        value_loss = optax.losses.l2_loss(value, batch.value)
-        value_loss = (value_loss * mask).sum()
-
-        weight_penalty_params = jax.tree_util.tree_leaves(params)
-        weight_l2 = sum(jnp.sum(x**2) for x in weight_penalty_params if x.ndim > 1)
-        weight_penalty = weight_decay * 0.5 * weight_l2
-
-        return policy_loss + value_loss + weight_penalty, (
-            new_model,
+        policy_loss = optax.losses.safe_softmax_cross_entropy(logits, batch.prob).mean()
+        value_loss = (optax.losses.l2_loss(value, batch.value) * batch.mask).mean()
+        return policy_loss + value_loss, (
+            new_model["batch_stats"],
             policy_loss,
             value_loss,
-            weight_penalty,
         )
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     aux, grads = grad_fn(model.params)
-    new_model, policy_loss, value_loss, wd_loss = aux[1]
+    batch_stats, policy_loss, value_loss = aux[1]
     new_model = model.apply_gradients(
         grads=grads,
-        batch_stats=new_model["batch_stats"],
+        batch_stats=batch_stats,
     )
-    return new_model, policy_loss, value_loss, wd_loss
+    return new_model, policy_loss, value_loss
 
 
 @jax.jit
-def eval_step(model: TrainState, key: chex.PRNGKey):
+def eval_step(
+    model: TrainState,
+    old_model: TrainState,
+    old_elo: chex.Scalar,
+    key: chex.PRNGKey,
+):
     k0, k1, k2 = jax.random.split(key, 3)
     model_player = jax.random.randint(k0, (num_batchsize_test,), 0, env.num_players)
     state = jax.vmap(env.init)(jax.random.split(k1, num_batchsize_test))
@@ -120,71 +187,28 @@ def eval_step(model: TrainState, key: chex.PRNGKey):
 
     def body(val):
         s, k, r = val
-        k, k0, k1 = jax.random.split(k, 3)
-        action_model = mcts.mcts_search(
-            (env, model),
-            state,
-            model_evaluate,
-            k0,
-            num_simulations=num_mcts_simulations,
-            dirichlet_fraction=0.0,
-            temperature=0.0,
-        ).action
-        action_random = mcts.mcts_search(
-            (env, model),
-            state,
-            mcts.random_evaluate,
-            k1,
-            num_simulations=num_mcts_simulations,
-            dirichlet_fraction=0.0,
-            temperature=0.0,
-        ).action
-        action = jnp.where(
-            s.current_player == model_player,
-            action_model,
-            action_random,
-        )
-        s = jax.vmap(env.step)(s, action)
-        r = r + s.rewards
-        return s, k, r
-
-    state, key, rewards = jax.lax.while_loop(cond, body, (state, k2, state.rewards))
-    rewards = jax.vmap(lambda x, i: x[i])(rewards, model_player)
-    return (rewards[..., None] == jnp.float32([1.0, 0.0, -1.0])).sum(
-        0
-    ) / num_batchsize_test
-
-
-@jax.jit
-def fast_eval_step(model: TrainState, key: chex.PRNGKey):
-    k0, k1, k2 = jax.random.split(key, 3)
-    model_player = jax.random.randint(k0, (num_batchsize_test,), 0, env.num_players)
-    state = jax.vmap(env.init)(jax.random.split(k1, num_batchsize_test))
-
-    def cond(val):
-        s, k, r = val
-        return ~s.terminated.all()
-
-    def body(val):
-        s, k, r = val
-        k, k0, k1 = jax.random.split(k, 3)
-        logits_model = model_evaluate((env, model), s, k0)[0]
-        logits_random = jnp.log(s.legal_action_mask)
+        k, k0, k1, k2 = jax.random.split(k, 4)
         logits = jnp.where(
             jnp.expand_dims(s.current_player == model_player, -1),
-            logits_model,
-            logits_random,
+            model_evaluate(model, s.observation, k0)[0],
+            model_evaluate(old_model, s.observation, k1)[0],
         )
-        action = jax.random.categorical(k1, logits)
+        logits = jnp.where(s.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+        action = jax.random.categorical(k2, logits)
         s = jax.vmap(env.step)(s, action)
         r = r + s.rewards
         return s, k, r
 
     state, key, rewards = jax.lax.while_loop(cond, body, (state, k2, state.rewards))
-    rewards = jax.vmap(lambda x, i: x[i])(rewards, model_player)
-    return (rewards[..., None] == jnp.float32([1.0, 0.0, -1.0])).sum(
-        0
-    ) / num_batchsize_test
+    rewards = jax.vmap(lambda x, i: x[i])(rewards, model_player) * 0.5 + 0.5
+
+    def body(elo, result):
+        expected_score = 1 / (1 + 10 ** ((old_elo - elo) / 400))
+        elo = elo + 32 * (result - expected_score)
+        return elo, elo
+
+    elo, _ = jax.lax.scan(body, old_elo, rewards)
+    return elo
 
 
 def main():
@@ -192,42 +216,34 @@ def main():
     key, subkey = jax.random.split(key)
     model = create_train_state(
         subkey,
-        AZNet(env.num_actions, 64, 6, dtype=jnp.bfloat16),
-        (1, *env.observation_shape),
+        AZNet(env.num_actions),
+        (num_batchsize_train, *env.observation_shape),
     )
+    elo = jnp.float32(600)
+
     if os.path.exists("./checkpoint"):
-        model = restore_checkpoint(os.path.abspath("./checkpoint"), model)
-    key, k0 = jax.random.split(key)
-    rate = fast_eval_step(model, k0) * 100
-    print(
-        f"step {model.step}, win={rate[0].item():4.2f}, draw={rate[1].item():4.2f}, loss={rate[2].item():4.2f}"
-    )
+        model, elo = restore_checkpoint(os.path.abspath("./checkpoint"), (model, elo))
+    while True:
+        key, k0, k1 = jax.random.split(key, 3)
+        data = self_play(model, k0)
 
-    while model.step < 2**18:
-        key, k0, k1, k2 = jax.random.split(key, 4)
-
-        data = [
-            self_play(model, k)
-            for k in tqdm.tqdm(jax.random.split(k0, num_self_play), desc="self-play")
-        ]
-        data = jax.tree.map(lambda *x: jnp.concat(x), *data)
-
-        ixs = jax.random.permutation(k1, data.obs.shape[0])
-        ixs = jnp.split(ixs, ixs.shape[0] // num_batchsize_train)
-        for ids in tqdm.tqdm(ixs, desc="train"):
-            model, ploss, vloss, wdloss = train_step(
+        old_model = model
+        for ids in range(data.obs.shape[0]):
+            model, ploss, vloss = train_step(
                 model,
                 jax.tree_util.tree_map(lambda x: x[ids], data),
             )
-
-        rate = fast_eval_step(model, k2) * 100
+        elo = eval_step(model, old_model, elo, k1)
         print(
-            f"step {model.step}, ploss={ploss.item():.5f}, vloss={vloss.item():.5f}, wdloss={wdloss.item():.5f}, win={rate[0].item():4.2f}, draw={rate[1].item():4.2f}, loss={rate[2].item():4.2f}"
+            f"step {model.step}"
+            f", ploss={ploss.item():.5f}"
+            f", vloss={vloss.item():.5f}"
+            f", elo={elo.item():.2f}"
         )
         save_checkpoint(
             os.path.abspath("./checkpoint"),
-            model,
-            int(model.step),
+            (model, elo),
+            elo.item(),
             keep=5,
         )
 
