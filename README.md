@@ -6,10 +6,9 @@ On a single **RTX 4070 Ti**, it can train a **strong 9×9 Gomoku agent** in appr
 
 *This README introduction was generated with the help of ChatGPT.*  
 
-
-| Model                         |  ELO |
-| ---                           |  --- |
-| **Freestyle Gomoku(9,5)**               |5475.6|
+<p align="center">
+  <img src="figs/gomoku_elo.svg" width="70%" height="auto" style="margin: 0 1%;">
+</p>
 
 -----------------
 
